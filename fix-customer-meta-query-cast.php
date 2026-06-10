@@ -32,31 +32,68 @@ function hcqo_optimize_customer_order_meta_query( $args ) {
 	$modified = false;
 
 	foreach ( $args['meta_query'] as $index => $clause ) {
-		if ( ! is_array( $clause ) ) {
-			continue;
-		}
-
-		if ( isset( $clause['key'], $clause['type'] ) && is_string( $clause['type'] ) && '_customer_user' === $clause['key'] && 'NUMERIC' === strtoupper( $clause['type'] ) ) {
+		if ( hcqo_is_rewritable_customer_clause( $clause ) ) {
 			$args['meta_query'][ $index ]['type'] = 'CHAR';
 			$modified = true;
 		}
 	}
 
 	if ( $modified ) {
-		// Once per request (static), once per 30 days across requests (transient).
-		// The transient's expiry is deliberate: the event re-fires periodically,
-		// so its absence after a WooCommerce upgrade signals the filter stopped matching.
+		// Confirmation canary: once per request (static), once per 30 days across
+		// requests (transient). The transient stores the WooCommerce version, so an
+		// upgrade re-fires the event immediately — silence after an upgrade therefore
+		// unambiguously means the filter stopped matching, not that the log is suppressed.
 		static $logged = false;
 		if ( ! $logged ) {
 			$logged = true;
-			if ( class_exists( 'Hypercart_Logger' ) && method_exists( 'Hypercart_Logger', 'info' ) && ! get_transient( 'hcqo_cast_fix_logged' ) ) {
-				set_transient( 'hcqo_cast_fix_logged', 1, 30 * DAY_IN_SECONDS );
+			$wc_version = defined( 'WC_VERSION' ) ? WC_VERSION : 'unknown';
+			if ( class_exists( 'Hypercart_Logger' ) && method_exists( 'Hypercart_Logger', 'info' ) && get_transient( 'hcqo_cast_fix_logged' ) !== $wc_version ) {
+				set_transient( 'hcqo_cast_fix_logged', $wc_version, 30 * DAY_IN_SECONDS );
 				Hypercart_Logger::info( 'customer_meta_query_cast_fixed', array(
-					'message' => 'Rewrote _customer_user meta query type from NUMERIC to CHAR.',
+					'message'    => 'Rewrote _customer_user meta query type from NUMERIC to CHAR.',
+					'wc_version' => $wc_version,
 				) );
 			}
 		}
 	}
 
 	return $args;
+}
+
+/**
+ * True only for the exact clause shape WooCommerce REST emits for ?customer=X:
+ * a flat _customer_user clause, type NUMERIC, equality compare ('=' or absent,
+ * which WP_Meta_Query defaults to '='), and a scalar non-negative integer value.
+ *
+ * CHAR comparison is equivalent to NUMERIC only for integer equality. Range
+ * compares (>, BETWEEN, ...) are lexicographic under CHAR ('10' < '9'), so any
+ * other shape is deliberately left on the slow-but-correct CAST() path.
+ *
+ * @param mixed $clause A meta_query element (clause array, nested group, or 'relation' string).
+ * @return bool Whether the clause is safe to rewrite to CHAR.
+ */
+function hcqo_is_rewritable_customer_clause( $clause ) {
+	if ( ! is_array( $clause ) ) {
+		return false;
+	}
+
+	if ( ! isset( $clause['key'], $clause['type'], $clause['value'] ) ) {
+		return false;
+	}
+
+	if ( '_customer_user' !== $clause['key'] ) {
+		return false;
+	}
+
+	if ( ! is_string( $clause['type'] ) || 'NUMERIC' !== strtoupper( $clause['type'] ) ) {
+		return false;
+	}
+
+	if ( isset( $clause['compare'] ) && '=' !== $clause['compare'] ) {
+		return false;
+	}
+
+	$value = $clause['value'];
+
+	return is_int( $value ) ? $value >= 0 : ( is_string( $value ) && '' !== $value && ctype_digit( $value ) );
 }
